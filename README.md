@@ -16,3 +16,5 @@ The Remote Serial Monitor is available on this local address: **192.168.1.4/webs
   **Name,   Type, SubType, Offset,    Size,   Flags**
   
   eeprom,   data, 0x99,    0x290000,  0x1000
+
+Remember to enter your CAN module configuration in the TwizyCfg_config.h tab.
