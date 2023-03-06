@@ -1,6 +1,6 @@
 /**
  * ==========================================================================
- * Twizy/SEVCON configuration shell
+ * Twizy/SEVCON configuration shell 
  * ==========================================================================
  * 
  * Based on the OVMS Twizy firmware:
