@@ -10,7 +10,9 @@
  * 
  * Libraries used:
  *  - MCP_CAN: https://github.com/coryjfowler/MCP_CAN_lib
- *  - iso-tp: https://github.com/altelch/iso-tp
+ *  - iso-tp: https://github.com/dexterbg/iso-tp [https://github.com/altelch/iso-tp]
+ *  - WebSerialLite: https://github.com/asjdf/WebSerialLite
+ *  - EEPROM: https://github.com/pbecchi/arduino-esp32/tree/EEprom_library/libraries/EEPROM
  * 
  * License:
  *  This is free software under GNU Lesser General Public License (LGPL)
@@ -20,6 +22,16 @@
 #define TWIZY_CFG_VERSION "V2.1.1 (2023-03-05)"
 
 #include <EEPROM.h>
+//
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <WebSerialLite.h>
+AsyncWebServer server(80);
+
+const char* ssid = "Twizy-Cfg"; // Your WiFi AP SSID 
+const char* password = "twizy1234cfg"; // Your WiFi Password
+//
 
 #include <mcp_can.h>
 #include <mcp_can_dfs.h>
@@ -30,7 +42,6 @@
 #include "CANopen.h"
 #include "Tuning.h"
 #include "TwizyCfg_config.h"
-
 
 // CAN interface:
 MCP_CAN CAN(TWIZY_CAN_CS_PIN);
@@ -56,7 +67,8 @@ enum cfg_command_id {
   cmdSet, cmdReset, cmdGet, cmdInfo, cmdSave, cmdLoad,
   cmdDrive, cmdRecup, cmdRamps, cmdRampLimits, cmdSmooth,
   cmdSpeed, cmdPower, cmdTSMap, cmdBrakelight,
-  cmdDiagAddress, cmdDiagRequest
+  cmdDiagAddress, cmdDiagRequest,
+  cmdReboot
 };
 
 enum cfg_command_mode {
@@ -107,7 +119,9 @@ const cfg_command command_table[] PROGMEM = {
   
   { "DA", cmdDiagAddress, modeOffline },
   { "DR", cmdDiagRequest, modeOffline },
-  
+
+  { "REBOOT", cmdReboot, modeOffline },
+
 };
 
 #define COMMAND_COUNT (sizeof(command_table)/sizeof(cfg_command))
@@ -154,6 +168,47 @@ bool exec(char *cmdline)
 
   if (cmd.id == cmdHelp) {
     Serial.print(F("\n"
+      "Twizy-Cfg " TWIZY_CFG_VERSION "\n"
+      "\n"
+      "Commands:\n"
+      " ?, help                  -- output this info\n"
+      " r <id> <sub>             -- read SDO register (numerical)\n"
+      " rs <id> <sub>            -- read SDO register (string)\n"
+      " w <id> <sub> <val>       -- write SDO register (numerical) & show old value\n"
+      " wo <id> <sub> <val>      -- write-only SDO register (numerical)\n"
+      " p                        -- preop mode\n"
+      " o                        -- op mode\n"
+      "(Hint: standard OVMS syntax also accepted)\n"
+      "\n"
+      " set <prf> <b64>          -- set profile from base64\n"
+      " reset <prf>              -- reset profile\n"
+      " get <prf>                -- get profile base64\n"
+      " info                     -- show main profile values\n"
+      " save <prf>               -- save config to profile\n"
+      " load <prf>               -- load config from profile\n"
+      "\n"
+      " drive <prc>              -- set drive level\n"
+      " recup <ntr> <brk>        -- set recuperation levels neutral & brake\n"
+      " ramps <st> <ac> <dc> <nt> <br> -- set ramp levels\n"
+      " rampl <ac> <dc>          -- set ramp limits\n"
+      " smooth <prc>             -- set smoothing\n"
+      "\n"
+      " speed <max> <warn>       -- set max & warn speed\n"
+      " power <trq> <pw1> <pw2> <cur> -- set torque, power & current levels\n"
+      " tsmap <DNB> <pt1..4>     -- set torque speed maps\n"
+      " brakelight <on> <off>    -- set brakelight accel levels\n"
+      "\n"
+      " da <sendid> <recvid>     -- set OBD2 device address\n"
+      " dr <hexstring>           -- send OBD2 request\n"
+      "\n"
+      "See OVMS manual & command overview for details.\n"
+      "Note: <id> and <sub> are hexadecimal, <val> are decimal\n"
+      "Examples:\n"
+      " rs 1008 0                -- read SEVCON firmware name\n"
+      " w 2920 3 325             -- set neutral recup level to 32.5%\n"
+      "\n"
+      ));
+      WebSerial.print(F("\n"
       "Twizy-Cfg " TWIZY_CFG_VERSION "\n"
       "\n"
       "Commands:\n"
@@ -406,11 +461,17 @@ bool exec(char *cmdline)
           else {
             // output response as hexstring:
             Serial.print(net_scratchpad);
+            //
+            WebSerial.print(net_scratchpad);
+            //
             net_scratchpad[0] = 0;
             for (i=0; i<tpMsg.len; i++) {
-              if ((byte)net_msg_scratchpad[i] < 0x10)
+              if ((byte)net_msg_scratchpad[i] < 0x10){
                 Serial.print(F("0"));
+                WebSerial.print(F("0"));
+              }             
               Serial.print((byte)net_msg_scratchpad[i], HEX);
+              WebSerial.print((byte)net_msg_scratchpad[i], HEX);
             }
             break;
           }
@@ -860,6 +921,7 @@ bool exec(char *cmdline)
     configmode(0);
     
   Serial.println(net_scratchpad);
+  WebSerial.println(net_scratchpad);
 
   return true;
 }
@@ -875,11 +937,14 @@ boolean stringComplete = false;  // whether the string is complete
 
 void setup() {
   
-  Serial.begin(1000000);
+  Serial.begin(115200);
   while (!Serial) {
     ; // wait for serial port to connect. Needed for native USB port only
   }
-  
+
+  // WebSerial setup
+  setupWebSerial();
+ 
   // reserve 200 bytes for the inputString:
   inputString.reserve(200);
 
@@ -913,23 +978,24 @@ void setup() {
   // Output info & prompt:
   exec((char *) "?");
   Serial.print("\n> ");
+  WebSerial.print("\n> ");
 }
 
 
 void loop() {
   
   if (stringComplete) {
-    
     // execute command:
     Serial.println(inputString);
+    WebSerial.println(inputString);
     exec((char *) inputString.c_str());
     Serial.print("\n> ");
-    
+    WebSerial.print("\n> ");
     // clear the string:
     inputString = "";
     stringComplete = false;
   }
-  
+
 }
 
 
@@ -943,12 +1009,36 @@ void serialEvent() {
   
   while (Serial.available()) {
     char inChar = (char)Serial.read();
-    if (inChar == '\r' || inChar == '\n') {
-      stringComplete = (inputString.length() > 0);
+    if (inChar == '\n') {
+      stringComplete = true;
     }
     else if (inChar >= 32) {
       inputString += inChar;
     }
   }
   
+}
+
+/* Message callback of WebSerial */
+void recvMsg(uint8_t *data, size_t len){
+    for(int i=0; i < len; i++){
+       if(char(data[i]) >= 32) {inputString += char(data[i]);}
+    }   
+    stringComplete = true;
+}
+
+void setupWebSerial() {
+
+    if (!EEPROM.begin(4096))
+    {
+       Serial.println("failed to initialize EEPROM");
+    }
+
+    WiFi.softAP(ssid, password);
+
+    IPAddress IP = WiFi.softAPIP();
+    WebSerial.begin(&server);
+    /* Attach Message Callback */
+    WebSerial.onMessage(recvMsg);
+    server.begin();
 }
